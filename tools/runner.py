@@ -9,6 +9,9 @@ from utils.logger import *
 from utils.AverageMeter import AverageMeter
 from utils.metrics import Metrics
 from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
+from tqdm import tqdm
+
+
 
 def run_net(args, config, train_writer=None, val_writer=None):
     logger = get_logger(args.log_name)
@@ -60,6 +63,8 @@ def run_net(args, config, train_writer=None, val_writer=None):
     else:
         print_log('Using Data parallel ...' , logger = logger)
         base_model = nn.DataParallel(base_model).cuda()
+
+
     # optimizer & scheduler
     optimizer = builder.build_optimizer(base_model, config)
     
@@ -87,6 +92,11 @@ def run_net(args, config, train_writer=None, val_writer=None):
         losses = AverageMeter(['SparseLoss', 'DenseLoss'])
 
         num_iter = 0
+        
+        # 进度条初始化
+        n_batches = len(train_dataloader)
+        progress_bar = tqdm(enumerate(train_dataloader), total=n_batches, 
+                             desc=f'Epoch {epoch}/{config.max_epoch}', ncols=100)
 
         base_model.train()  # set model to training mode
         n_batches = len(train_dataloader)
@@ -94,7 +104,7 @@ def run_net(args, config, train_writer=None, val_writer=None):
             data_time.update(time.time() - batch_start_time)
             npoints = config.dataset.train._base_.N_POINTS
             dataset_name = config.dataset.train._base_.NAME
-            if dataset_name == 'PCN' or dataset_name == 'Completion3D' or dataset_name == 'Projected_ShapeNet':
+            if dataset_name in ['PCN', 'Completion3D', 'Projected_ShapeNet', 'Rice']:
                 partial = data[0].cuda()
                 gt = data[1].cuda()
                 if config.dataset.train._base_.CARS:
@@ -143,6 +153,18 @@ def run_net(args, config, train_writer=None, val_writer=None):
 
             batch_time.update(time.time() - batch_start_time)
             batch_start_time = time.time()
+
+            # 计算并更新剩余时间
+            elapsed_time = time.time() - epoch_start_time
+            remaining_time = (elapsed_time / (idx + 1)) * (len(train_dataloader) - (idx + 1))
+
+            # 更新进度条显示内容
+            progress_bar.set_postfix(
+                Loss=f'{losses.val(0):.4f}', 
+                Remaining=f'{remaining_time//60:.0f}m {remaining_time%60:.0f}s', 
+                BatchTime=f'{batch_time.avg():.3f}s',  # 使用 avg() 方法获取平均时间
+                DataTime=f'{data_time.avg():.3f}s'    # 使用 avg() 方法获取平均时间
+            )
 
             if idx % 100 == 0:
                 print_log('[Epoch %d/%d][Batch %d/%d] BatchTime = %.3f (s) DataTime = %.3f (s) Losses = %s lr = %.6f' %
@@ -199,7 +221,7 @@ def validate(base_model, test_dataloader, epoch, ChamferDisL1, ChamferDisL2, val
 
             npoints = config.dataset.val._base_.N_POINTS
             dataset_name = config.dataset.val._base_.NAME
-            if dataset_name == 'PCN' or dataset_name == 'Completion3D' or dataset_name == 'Projected_ShapeNet':
+            if dataset_name in ['PCN', 'Completion3D', 'Projected_ShapeNet', 'Rice']:
                 partial = data[0].cuda()
                 gt = data[1].cuda()
             elif dataset_name == 'ShapeNet':
@@ -272,8 +294,7 @@ def validate(base_model, test_dataloader, epoch, ChamferDisL1, ChamferDisL2, val
             torch.cuda.synchronize()
      
     # Print testing results
-    shapenet_dict = json.load(open('./data/shapenet_synset_dict.json', 'r'))
-    print_log('============================ TEST RESULTS ============================',logger=logger)
+    print_log('============================ TEST RESULTS ============================', logger=logger)
     msg = ''
     msg += 'Taxonomy\t'
     msg += '#Sample\t'
@@ -288,8 +309,15 @@ def validate(base_model, test_dataloader, epoch, ChamferDisL1, ChamferDisL2, val
         msg += (str(category_metrics[taxonomy_id].count(0)) + '\t')
         for value in category_metrics[taxonomy_id].avg():
             msg += '%.3f \t' % value
-        msg += shapenet_dict[taxonomy_id] + '\t'
+
+        # Check if the dataset is Rice to avoid KeyError
+        if dataset_name == 'Rice':
+            msg += taxonomy_id + '\t'  # For Rice, we directly use taxonomy_id as class name
+        else:
+            msg += shapenet_dict.get(taxonomy_id, 'Unknown') + '\t'  # Use 'Unknown' if the taxonomy_id is missing
+
         print_log(msg, logger=logger)
+
 
     msg = ''
     msg += 'Overall\t\t'
@@ -350,7 +378,7 @@ def test(base_model, test_dataloader, ChamferDisL1, ChamferDisL2, args, config, 
 
             npoints = config.dataset.test._base_.N_POINTS
             dataset_name = config.dataset.test._base_.NAME
-            if dataset_name == 'PCN' or dataset_name == 'Projected_ShapeNet':
+            if dataset_name in ['PCN', 'Projected_ShapeNet', 'Rice']:
                 partial = data[0].cuda()
                 gt = data[1].cuda()
 
