@@ -472,7 +472,13 @@ def test(base_model, test_dataloader, ChamferDisL1, ChamferDisL2, args, config, 
         msg += (str(category_metrics[taxonomy_id].count(0)) + '\t')
         for value in category_metrics[taxonomy_id].avg():
             msg += '%.3f \t' % value
-        msg += shapenet_dict[taxonomy_id] + '\t'
+
+        # 兼容处理，如果找不到则使用 taxonomy_id
+        if taxonomy_id in shapenet_dict:
+            msg += shapenet_dict[taxonomy_id] + '\t'
+        else:
+            msg += taxonomy_id + '\t'  # 直接使用分类ID
+            
         print_log(msg, logger=logger)
 
     msg = ''
