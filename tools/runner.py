@@ -20,8 +20,15 @@ def run_net(args, config, train_writer=None, val_writer=None):
                                                             builder.dataset_builder(args, config.dataset.val)
     # build model
     base_model = builder.model_builder(config.model)
+    # if args.use_gpu:
+    #     base_model.to(args.local_rank)
     if args.use_gpu:
-        base_model.to(args.local_rank)
+    # 单卡或DataParallel时不需要指定local_rank
+        if not args.distributed:
+            base_model = base_model.cuda()  # 移动到默认GPU
+        else:
+            # DDP模式才使用local_rank
+            base_model.to(args.local_rank)
 
     # from IPython import embed; embed()
     
