@@ -13,93 +13,55 @@ from tqdm import tqdm
 
 
 
-import torch
-import torch.nn as nn
-import os
-import json
-from tools import builder
-from utils import misc, dist_utils
-import time
-from utils.logger import *
-from utils.AverageMeter import AverageMeter
-from utils.metrics import Metrics
-from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
-from tqdm import tqdm
-import gc
-
-
-
 def run_net(args, config, train_writer=None, val_writer=None):
     logger = get_logger(args.log_name)
-    
-    # ============ 1. 初始化内存监控 ============
-    class MemoryMonitor:
-        def __init__(self):
-            self.epoch_memory = []
-            
-        def check(self, step_name=""):
-            if torch.cuda.is_available():
-                allocated = torch.cuda.memory_allocated() / 1024**3
-                cached = torch.cuda.memory_reserved() / 1024**3
-                
-                if step_name:
-                    print_log(f"[内存监控] {step_name}: {allocated:.2f}GB / {cached:.2f}GB", logger=logger)
-                    
-                return allocated
-            return 0
-            
-        def safe_clear(self):
-            """安全的内存清理"""
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-    
-    memory_monitor = MemoryMonitor()
-    memory_monitor.safe_clear()  # 开始前清理一次
-    
-    # ============ 2. 构建数据集 ============
-    memory_monitor.check("构建数据集前")
-    
-    # 修改数据加载器参数，减少内存占用
-    original_workers = config.dataset.train._base_.get('num_workers', 8)
-    config.dataset.train._base_.num_workers = min(original_workers, 4)  # 减少worker
-    config.dataset.val._base_.num_workers = min(original_workers, 4)
-    
+    # build dataset
     (train_sampler, train_dataloader), (_, test_dataloader) = builder.dataset_builder(args, config.dataset.train), \
                                                             builder.dataset_builder(args, config.dataset.val)
-    
-    memory_monitor.check("构建数据集后")
-    
-    # ============ 3. 构建模型 ============
+    # build model
     base_model = builder.model_builder(config.model)
-    
+    # if args.use_gpu:
+    #     base_model.to(args.local_rank)
     if args.use_gpu:
+    # 单卡或DataParallel时不需要指定local_rank
         if not args.distributed:
-            base_model = base_model.cuda()
+            base_model = base_model.cuda()  # 移动到默认GPU
         else:
+            # DDP模式才使用local_rank
             base_model.to(args.local_rank)
+
+    # from IPython import embed; embed()
     
-    memory_monitor.check("模型加载后")
-    
-    # ============ 4. 参数设置 ============
+    # parameter setting
     start_epoch = 0
     best_metrics = None
     metrics = None
 
-    # 恢复检查点
+    # resume ckpts
     if args.resume:
         start_epoch, best_metrics = builder.resume_model(base_model, args, logger = logger)
         best_metrics = Metrics(config.consider_metric, best_metrics)
     elif args.start_ckpts is not None:
         builder.load_model(base_model, args.start_ckpts, logger = logger)
 
-    # 打印模型信息（可选的，如果内存紧张可以注释掉）
-    # print_log('Trainable_parameters:', logger = logger)
-    # ...
+    # print model info
+    print_log('Trainable_parameters:', logger = logger)
+    print_log('=' * 25, logger = logger)
+    for name, param in base_model.named_parameters():
+        if param.requires_grad:
+            print_log(name, logger=logger)
+    print_log('=' * 25, logger = logger)
+    
+    print_log('Untrainable_parameters:', logger = logger)
+    print_log('=' * 25, logger = logger)
+    for name, param in base_model.named_parameters():
+        if not param.requires_grad:
+            print_log(name, logger=logger)
+    print_log('=' * 25, logger = logger)
 
-    # ============ 5. 分布式设置 ============
+    # DDP
     if args.distributed:
+        # Sync BN
         if args.sync_bn:
             base_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(base_model)
             print_log('Using Synchronized BatchNorm ...', logger = logger)
@@ -109,26 +71,27 @@ def run_net(args, config, train_writer=None, val_writer=None):
         print_log('Using Data parallel ...' , logger = logger)
         base_model = nn.DataParallel(base_model).cuda()
 
-    # ============ 6. 优化器和损失函数 ============
+
+    # optimizer & scheduler
     optimizer = builder.build_optimizer(base_model, config)
+    
+    # Criterion
     ChamferDisL1 = ChamferDistanceL1()
     ChamferDisL2 = ChamferDistanceL2()
+
 
     if args.resume:
         builder.resume_optimizer(optimizer, args, logger = logger)
     scheduler = builder.build_scheduler(base_model, optimizer, config, last_epoch=start_epoch-1)
 
-    # ============ 7. 修复的训练循环 ============
+    # trainval
+    # training
     base_model.zero_grad()
-    
-    # 获取实际的数据集大小
-    n_batches = len(train_dataloader)
-    print_log(f"总批次数: {n_batches}", logger=logger)
-    
     for epoch in range(start_epoch, config.max_epoch + 1):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        
+        base_model.train()
+
         epoch_start_time = time.time()
         batch_start_time = time.time()
         batch_time = AverageMeter()
@@ -137,88 +100,48 @@ def run_net(args, config, train_writer=None, val_writer=None):
 
         num_iter = 0
         
-        # 修复的进度条 - 显示剩余时间
-        progress_bar = tqdm(
-            enumerate(train_dataloader), 
-            total=n_batches, 
-            desc=f'Epoch {epoch}/{config.max_epoch}', 
-            ncols=120,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
-        )
+        # 进度条初始化
+        n_batches = len(train_dataloader)
+        progress_bar = tqdm(enumerate(train_dataloader), total=n_batches, 
+                             desc=f'Epoch {epoch}/{config.max_epoch}', ncols=100)
 
-        base_model.train()
-        
-        # 修复：分批处理，及时清理内存
-        for idx, (taxonomy_ids, model_ids, data) in progress_bar:
-            # 记录数据加载时间
+        base_model.train()  # set model to training mode
+        n_batches = len(train_dataloader)
+        for idx, (taxonomy_ids, model_ids, data) in enumerate(train_dataloader):
             data_time.update(time.time() - batch_start_time)
-            
-            # 获取配置参数
             npoints = config.dataset.train._base_.N_POINTS
             dataset_name = config.dataset.train._base_.NAME
-            
-            # ============ 数据处理 ============
             if dataset_name in ['PCN', 'Completion3D', 'Projected_ShapeNet', 'Rice']:
                 partial = data[0].cuda()
                 gt = data[1].cuda()
-                
                 if config.dataset.train._base_.CARS:
                     if idx == 0:
                         print_log('padding while KITTI training', logger=logger)
-                    partial = misc.random_dropping(partial, epoch)
-                    
+                    partial = misc.random_dropping(partial, epoch) # specially for KITTI finetune
+
             elif dataset_name == 'ShapeNet':
                 gt = data.cuda()
                 partial, _ = misc.seprate_point_cloud(gt, npoints, [int(npoints * 1/4) , int(npoints * 3/4)], fixed_points = None)
                 partial = partial.cuda()
             else:
                 raise NotImplementedError(f'Train phase do not support {dataset_name}')
-            
-            # ============ 前向传播 ============
+
             num_iter += 1
            
-            try:
-                ret = base_model(partial)
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print_log(f"GPU内存不足! batch {idx}", logger=logger)
-                    memory_monitor.safe_clear()
-                    # 跳过这个批次
-                    continue
-                else:
-                    raise e
+            ret = base_model(partial)
             
-            # ============ 计算损失 ============
             sparse_loss, dense_loss = base_model.module.get_loss(ret, gt, epoch)
+         
             _loss = sparse_loss + dense_loss 
-            
-            # ============ 反向传播 ============
             _loss.backward()
 
-            # ============ 梯度更新 ============
+            # forward
             if num_iter == config.step_per_update:
-                # 梯度裁剪
                 torch.nn.utils.clip_grad_norm_(base_model.parameters(), getattr(config, 'grad_norm_clip', 10), norm_type=2)
                 num_iter = 0
-                
-                try:
-                    optimizer.step()
-                except RuntimeError as e:
-                    if "CUDA" in str(e):
-                        print_log(f"优化器步骤CUDA错误: {e}", logger=logger)
-                        memory_monitor.safe_clear()
-                        # 重试一次
-                        try:
-                            optimizer.step()
-                        except:
-                            print_log("重试失败，跳过这个批次", logger=logger)
-                            continue
-                    else:
-                        raise e
-                        
+                optimizer.step()
                 base_model.zero_grad()
 
-            # ============ 损失统计 ============
             if args.distributed:
                 sparse_loss = dist_utils.reduce_tensor(sparse_loss, args)
                 dense_loss = dist_utils.reduce_tensor(dense_loss, args)
@@ -226,121 +149,63 @@ def run_net(args, config, train_writer=None, val_writer=None):
             else:
                 losses.update([sparse_loss.item() * 1000, dense_loss.item() * 1000])
 
+
             if args.distributed:
                 torch.cuda.synchronize()
 
             n_itr = epoch * n_batches + idx
-            
-            # ============ TensorBoard记录 ============
             if train_writer is not None:
                 train_writer.add_scalar('Loss/Batch/Sparse', sparse_loss.item() * 1000, n_itr)
                 train_writer.add_scalar('Loss/Batch/Dense', dense_loss.item() * 1000, n_itr)
 
-            # ============ 时间统计 ============
             batch_time.update(time.time() - batch_start_time)
             batch_start_time = time.time()
 
-            # ============ 计算进度条信息 ============
+            # 计算并更新剩余时间
             elapsed_time = time.time() - epoch_start_time
-            avg_batch_time = batch_time.avg
-            if callable(avg_batch_time):
-                avg_batch_time = avg_batch_time()
-                
-            # 修复：避免除零错误
-            if idx > 0 and avg_batch_time > 0:
-                batches_remaining = n_batches - (idx + 1)
-                remaining_time = avg_batch_time * batches_remaining
-                
-                # 转换为小时:分钟:秒
-                hours, remainder = divmod(remaining_time, 3600)
-                minutes, seconds = divmod(remainder, 60)
-                
-                if hours > 0:
-                    remaining_str = f"{int(hours)}h{int(minutes)}m"
-                elif minutes > 0:
-                    remaining_str = f"{int(minutes)}m{int(seconds)}s"
-                else:
-                    remaining_str = f"{seconds:.1f}s"
-                    
-                # 更新进度条
-                progress_bar.set_postfix({
-                    'Loss': f'{losses.val(0):.4f}',
-                    'Remain': remaining_str,
-                    'Batch': f'{batch_time.val():.3f}s',
-                    'Data': f'{data_time.val():.3f}s'
-                })
-            else:
-                progress_bar.set_postfix({
-                    'Loss': f'{losses.val(0):.4f}',
-                    'Remain': '计算中...',
-                    'Batch': f'{batch_time.val():.3f}s',
-                    'Data': f'{data_time.val():.3f}s'
-                })
+            remaining_time = (elapsed_time / (idx + 1)) * (len(train_dataloader) - (idx + 1))
 
-            # ============ 定期日志 ============
+            # 更新进度条显示内容
+            progress_bar.set_postfix(
+                Loss=f'{losses.val(0):.4f}', 
+                Remaining=f'{remaining_time//60:.0f}m {remaining_time%60:.0f}s', 
+                BatchTime=f'{batch_time.avg():.3f}s',  # 使用 avg() 方法获取平均时间
+                DataTime=f'{data_time.avg():.3f}s'    # 使用 avg() 方法获取平均时间
+            )
+
             if idx % 100 == 0:
                 print_log('[Epoch %d/%d][Batch %d/%d] BatchTime = %.3f (s) DataTime = %.3f (s) Losses = %s lr = %.6f' %
                             (epoch, config.max_epoch, idx + 1, n_batches, batch_time.val(), data_time.val(),
                             ['%.4f' % l for l in losses.val()], optimizer.param_groups[0]['lr']), logger = logger)
-            
-            # ============ 定期内存清理 ============
-            if idx % 50 == 0:
-                # 清理不需要的变量
-                del ret, sparse_loss, dense_loss, _loss
-                if 'partial' in locals():
-                    del partial
-                if 'gt' in locals():
-                    del gt
-                    
-                # 安全清理（不干扰训练）
-                gc.collect()
-                if torch.cuda.is_available() and idx % 200 == 0:
-                    torch.cuda.empty_cache()
-                    memory_monitor.check(f"Epoch {epoch} Batch {idx}")
 
             if config.scheduler.type == 'GradualWarmup':
                 if n_itr < config.scheduler.kwargs_2.total_epoch:
                     scheduler.step()
 
-        # ============ 周期结束处理 ============
         if isinstance(scheduler, list):
             for item in scheduler:
                 item.step()
         else:
             scheduler.step()
-            
         epoch_end_time = time.time()
 
-        # ============ 周期日志 ============
         if train_writer is not None:
             train_writer.add_scalar('Loss/Epoch/Sparse', losses.avg(0), epoch)
             train_writer.add_scalar('Loss/Epoch/Dense', losses.avg(1), epoch)
-            
         print_log('[Training] EPOCH: %d EpochTime = %.3f (s) Losses = %s' %
-            (epoch, epoch_end_time - epoch_start_time, ['%.4f' % l for l in losses.avg()]), logger = logger)
+            (epoch,  epoch_end_time - epoch_start_time, ['%.4f' % l for l in losses.avg()]), logger = logger)
 
-        # ============ 验证 ============
         if epoch % args.val_freq == 0:
-            # 验证前清理内存
-            memory_monitor.safe_clear()
-            
+            # Validate the current model
             metrics = validate(base_model, test_dataloader, epoch, ChamferDisL1, ChamferDisL2, val_writer, args, config, logger=logger)
 
-            # 保存检查点
-            if metrics.better_than(best_metrics):
+            # Save ckeckpoints
+            if  metrics.better_than(best_metrics):
                 best_metrics = metrics
                 builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-best', args, logger = logger)
-                
-        # ============ 保存检查点 ============
         builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-last', args, logger = logger)      
-        
         if (config.max_epoch - epoch) < 2:
             builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, f'ckpt-epoch-{epoch:03d}', args, logger = logger)     
-            
-        # 每个epoch结束后清理内存
-        memory_monitor.safe_clear()
-    
-    # ============ 训练结束 ============
     if train_writer is not None and val_writer is not None:
         train_writer.close()
         val_writer.close()
